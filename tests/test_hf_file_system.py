@@ -23,6 +23,7 @@ from huggingface_hub.hf_file_system import (
     HfFileSystemStreamFile,
 )
 
+from .conftest import RepoFactory
 from .testing_constants import ENDPOINT_STAGING, TOKEN
 from .testing_utils import OfflineSimulationMode, offline, repo_name
 
@@ -335,6 +336,23 @@ class _HfFileSystemBaseROTests(_HfFileSystemBaseTests):
             temp_file.seek(0)
             assert temp_file.read() == b"dummy text data"
 
+    def test_get_file_without_lpath(self):
+        with tempfile.TemporaryFile() as temp_file:
+            self.hffs.get_file(self.text_file, outfile=temp_file)
+            temp_file.seek(0)
+            assert temp_file.read() == b"dummy text data"
+
+    def test_get_file_outfile_takes_precedence_over_filelike_lpath(self):
+        with tempfile.TemporaryFile() as lpath, tempfile.TemporaryFile() as outfile:
+            self.hffs.get_file(self.text_file, lpath, outfile=outfile)
+            outfile.seek(0)
+            assert outfile.read() == b"dummy text data"
+            assert lpath.tell() == 0
+
+    def test_get_file_without_lpath_and_outfile_raises(self):
+        with pytest.raises(ValueError, match="Either `lpath` or `outfile` must be provided"):
+            self.hffs.get_file(self.text_file)
+
     def test_get_file_with_temporary_folder(self):
         # Test passing a file path works
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
@@ -343,18 +361,34 @@ class _HfFileSystemBaseROTests(_HfFileSystemBaseTests):
             with open(temp_file, "rb") as f:
                 assert f.read() == b"dummy text data"
 
+    def test_get_file_with_bare_filename(self):
+        # Test passing a bare filename works => downloads to the current working directory
+        cwd = os.getcwd()
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            os.chdir(temp_dir)
+            try:
+                self.hffs.get_file(self.text_file, "temp_file.txt")
+                with open(os.path.join(temp_dir, "temp_file.txt"), "rb") as f:
+                    assert f.read() == b"dummy text data"
+            finally:
+                os.chdir(cwd)
+
     def test_get_file_with_kwargs(self):
         # If custom kwargs are passed, the function should still work but defaults to base implementation
-        with patch.object(hf_file_system, "http_get") as mock:
+        with (
+            patch.object(hf_file_system, "http_get") as http_mock,
+            patch.object(hf_file_system, "xet_get") as xet_mock,
+        ):
             with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
                 temp_file = os.path.join(temp_dir, "temp_file.txt")
                 self.hffs.get_file(self.text_file, temp_file, custom_kwarg=123)
-            mock.assert_not_called()
+            http_mock.assert_not_called()
+            xet_mock.assert_not_called()
 
             with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
                 temp_file = os.path.join(temp_dir, "temp_file.txt")
                 self.hffs.get_file(self.text_file, temp_file)
-            mock.assert_called_once()
+            assert http_mock.call_count + xet_mock.call_count == 1
 
     def test_get_file_on_folder(self):
         # Test it works with custom kwargs
@@ -480,6 +514,8 @@ class _HfFileSystemBucketChecks:
             assert info["size"] > 0  # not empty
 
 
+# File streaming uses plain HTTP instead of Xet without `hf_xet`.
+@pytest.mark.transfer
 class TestHfFileSystemRepositoryRO(_HfFileSystemRepositoryChecks, _HfFileSystemBaseROTests):
     __test__ = True
 
@@ -489,49 +525,51 @@ class TestHfFileSystemRepositoryRO(_HfFileSystemRepositoryChecks, _HfFileSystemB
 
         # Create dummy repo
         repo_url = api.create_repo(repo_name(), repo_type="dataset")
-        repo_id = repo_url.repo_id
-        hf_path = f"datasets/{repo_id}"
-        request.cls.repo_id = repo_id
-        request.cls.hf_path = hf_path
+        try:
+            repo_id = repo_url.repo_id
+            hf_path = f"datasets/{repo_id}"
+            request.cls.repo_id = repo_id
+            request.cls.hf_path = hf_path
 
-        # Upload files
-        api.upload_file(
-            path_or_fileobj=b"dummy binary data on pr",
-            path_in_repo="data/binary_data_for_pr.bin",
-            repo_id=repo_id,
-            repo_type="dataset",
-            create_pr=True,
-        )
-        api.upload_file(
-            path_or_fileobj="dummy text data".encode("utf-8"),
-            path_in_repo="data/text_data.txt",
-            repo_id=repo_id,
-            repo_type="dataset",
-        )
-        api.upload_file(
-            path_or_fileobj=b"dummy binary data",
-            path_in_repo="data/binary_data.bin",
-            repo_id=repo_id,
-            repo_type="dataset",
-        )
-        api.upload_file(
-            path_or_fileobj="# Dataset card".encode("utf-8"),
-            path_in_repo="README.md",
-            repo_id=repo_id,
-            repo_type="dataset",
-        )
-        api.delete_file(
-            path_in_repo=".gitattributes",
-            repo_id=repo_id,
-            repo_type="dataset",
-        )
+            # Upload files
+            api.upload_file(
+                path_or_fileobj=b"dummy binary data on pr",
+                path_in_repo="data/binary_data_for_pr.bin",
+                repo_id=repo_id,
+                repo_type="dataset",
+                create_pr=True,
+            )
+            api.upload_file(
+                path_or_fileobj="dummy text data".encode("utf-8"),
+                path_in_repo="data/text_data.txt",
+                repo_id=repo_id,
+                repo_type="dataset",
+            )
+            api.upload_file(
+                path_or_fileobj=b"dummy binary data",
+                path_in_repo="data/binary_data.bin",
+                repo_id=repo_id,
+                repo_type="dataset",
+            )
+            api.upload_file(
+                path_or_fileobj="# Dataset card".encode("utf-8"),
+                path_in_repo="README.md",
+                repo_id=repo_id,
+                repo_type="dataset",
+            )
+            api.delete_file(
+                path_in_repo=".gitattributes",
+                repo_id=repo_id,
+                repo_type="dataset",
+            )
 
-        request.cls.readme_file_path = "README.md"
-        request.cls.readme_file = hf_path + "/" + "README.md"
-        request.cls.text_file_path = "data/text_data.txt"
-        request.cls.text_file = hf_path + "/" + "data/text_data.txt"
-        yield
-        api.delete_repo(repo_id, repo_type="dataset")
+            request.cls.readme_file_path = "README.md"
+            request.cls.readme_file = hf_path + "/" + "README.md"
+            request.cls.text_file_path = "data/text_data.txt"
+            request.cls.text_file = hf_path + "/" + "data/text_data.txt"
+            yield
+        finally:
+            api.delete_repo(repo_id, repo_type="dataset", missing_ok=True)
 
     @pytest.fixture(autouse=True)
     def _new_hffs(self):
@@ -578,6 +616,18 @@ class TestHfFileSystemRepositoryRO(_HfFileSystemRepositoryChecks, _HfFileSystemB
         with self.hffs.open(self.hf_path + "/data/binary_data_for_pr.bin", "rb", revision="refs/pr/1") as f:
             assert f.read() == b"dummy binary data on pr"
 
+    @pytest.mark.xet
+    def test_get_file_with_xet(self):
+        with (
+            patch.object(hf_file_system, "xet_get", wraps=hf_file_system.xet_get) as xet_mock,
+            tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir,
+        ):
+            self.hffs.get_file(self.hf_path + "/data/binary_data.bin", f"{temp_dir}/main.bin")
+            self.hffs.get_file(self.hf_path + "@refs/pr/1/data/binary_data_for_pr.bin", f"{temp_dir}/pr.bin")
+            assert Path(temp_dir, "main.bin").read_bytes() == b"dummy binary data"
+            assert Path(temp_dir, "pr.bin").read_bytes() == b"dummy binary data on pr"
+        assert xet_mock.call_count == 2
+
     def test_list_data_directory_with_revision(self):
         files = self.hffs.ls(self.hf_path + "@refs%2Fpr%2F1" + "/data")
 
@@ -598,6 +648,8 @@ class TestHfFileSystemRepositoryRO(_HfFileSystemRepositoryChecks, _HfFileSystemB
                 assert "@refs/pr/1" in files[0]["name"]
 
 
+# Writes go through the LFS upload protocol without `hf_xet`.
+@pytest.mark.transfer
 class TestHfFileSystemRepositoryRW(_HfFileSystemRepositoryChecks, _HfFileSystemBaseRWTests):
     __test__ = True
 
@@ -607,47 +659,49 @@ class TestHfFileSystemRepositoryRW(_HfFileSystemRepositoryChecks, _HfFileSystemB
 
         # Create dummy repo
         repo_url = self.api.create_repo(repo_name(), repo_type="dataset")
-        self.repo_id = repo_url.repo_id
-        self.hf_path = f"datasets/{self.repo_id}"
+        try:
+            self.repo_id = repo_url.repo_id
+            self.hf_path = f"datasets/{self.repo_id}"
 
-        # Upload files
-        self.api.upload_file(
-            path_or_fileobj=b"dummy binary data on pr",
-            path_in_repo="data/binary_data_for_pr.bin",
-            repo_id=self.repo_id,
-            repo_type="dataset",
-            create_pr=True,
-        )
-        self.api.upload_file(
-            path_or_fileobj="dummy text data".encode("utf-8"),
-            path_in_repo="data/text_data.txt",
-            repo_id=self.repo_id,
-            repo_type="dataset",
-        )
-        self.api.upload_file(
-            path_or_fileobj=b"dummy binary data",
-            path_in_repo="data/binary_data.bin",
-            repo_id=self.repo_id,
-            repo_type="dataset",
-        )
-        self.api.upload_file(
-            path_or_fileobj="# Dataset card".encode("utf-8"),
-            path_in_repo="README.md",
-            repo_id=self.repo_id,
-            repo_type="dataset",
-        )
-        self.api.delete_file(
-            path_in_repo=".gitattributes",
-            repo_id=self.repo_id,
-            repo_type="dataset",
-        )
+            # Upload files
+            self.api.upload_file(
+                path_or_fileobj=b"dummy binary data on pr",
+                path_in_repo="data/binary_data_for_pr.bin",
+                repo_id=self.repo_id,
+                repo_type="dataset",
+                create_pr=True,
+            )
+            self.api.upload_file(
+                path_or_fileobj="dummy text data".encode("utf-8"),
+                path_in_repo="data/text_data.txt",
+                repo_id=self.repo_id,
+                repo_type="dataset",
+            )
+            self.api.upload_file(
+                path_or_fileobj=b"dummy binary data",
+                path_in_repo="data/binary_data.bin",
+                repo_id=self.repo_id,
+                repo_type="dataset",
+            )
+            self.api.upload_file(
+                path_or_fileobj="# Dataset card".encode("utf-8"),
+                path_in_repo="README.md",
+                repo_id=self.repo_id,
+                repo_type="dataset",
+            )
+            self.api.delete_file(
+                path_in_repo=".gitattributes",
+                repo_id=self.repo_id,
+                repo_type="dataset",
+            )
 
-        self.readme_file_path = "README.md"
-        self.readme_file = self.hf_path + "/" + self.readme_file_path
-        self.text_file_path = "data/text_data.txt"
-        self.text_file = self.hf_path + "/" + self.text_file_path
-        yield
-        self.api.delete_repo(self.repo_id, repo_type="dataset")
+            self.readme_file_path = "README.md"
+            self.readme_file = self.hf_path + "/" + self.readme_file_path
+            self.text_file_path = "data/text_data.txt"
+            self.text_file = self.hf_path + "/" + self.text_file_path
+            yield
+        finally:
+            self.api.delete_repo(self.repo_id, repo_type="dataset", missing_ok=True)
 
     def test_remove_file_with_revision(self):
         self.hffs.rm_file(self.hf_path + "@refs/pr/1" + "/data/binary_data_for_pr.bin")
@@ -846,16 +900,14 @@ def test_access_repositories_lists(not_supported_path, expected_error: Type[Exce
         fs.open(not_supported_path)
 
 
-def test_exists_after_repo_deletion():
+def test_exists_after_repo_deletion(repo_factory: RepoFactory):
     """Test that exists() correctly reflects repository deletion."""
     # Initialize with staging endpoint and skip cache
     hffs = HfFileSystem(endpoint=ENDPOINT_STAGING, token=TOKEN, skip_instance_cache=True)
     api = hffs._api
 
     # Create a new repo
-    temp_repo_id = repo_name()
-    repo_url = api.create_repo(temp_repo_id)
-    repo_id = repo_url.repo_id
+    repo_id = repo_factory().repo_id
     assert hffs.exists(repo_id, refresh=True)
     # Delete the repo
     api.delete_repo(repo_id=repo_id, repo_type="model")

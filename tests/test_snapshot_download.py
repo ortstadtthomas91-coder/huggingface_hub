@@ -53,41 +53,43 @@ class TestSnapshotDownload:
         Share this valid token in all tests below.
         """
         repo_id = api.create_repo(repo_name("snapshot-download")).repo_id
-        request.cls.repo_id = repo_id
+        try:
+            request.cls.repo_id = repo_id
 
-        # First commit on `main`
-        request.cls.first_commit_hash = api.create_commit(
-            repo_id=repo_id,
-            operations=[
-                CommitOperationAdd(path_in_repo="dummy_file.txt", path_or_fileobj=b"v1"),
-                CommitOperationAdd(path_in_repo="subpath/file.txt", path_or_fileobj=b"content in subpath"),
-            ],
-            commit_message="Add file to main branch",
-        ).oid
+            # First commit on `main`
+            request.cls.first_commit_hash = api.create_commit(
+                repo_id=repo_id,
+                operations=[
+                    CommitOperationAdd(path_in_repo="dummy_file.txt", path_or_fileobj=b"v1"),
+                    CommitOperationAdd(path_in_repo="subpath/file.txt", path_or_fileobj=b"content in subpath"),
+                ],
+                commit_message="Add file to main branch",
+            ).oid
 
-        # Second commit on `main`
-        request.cls.second_commit_hash = api.create_commit(
-            repo_id=repo_id,
-            operations=[
-                CommitOperationAdd(path_in_repo="dummy_file.txt", path_or_fileobj=b"v2"),
-                CommitOperationAdd(path_in_repo="file.bin", path_or_fileobj=os.urandom(1 * 1024 * 1024)),
-            ],
-            commit_message="Add file to main branch",
-        ).oid
+            # Second commit on `main`
+            request.cls.second_commit_hash = api.create_commit(
+                repo_id=repo_id,
+                operations=[
+                    CommitOperationAdd(path_in_repo="dummy_file.txt", path_or_fileobj=b"v2"),
+                    CommitOperationAdd(path_in_repo="file.bin", path_or_fileobj=os.urandom(1 * 1024 * 1024)),
+                ],
+                commit_message="Add file to main branch",
+            ).oid
 
-        # Third commit on `other`
-        api.create_branch(repo_id=repo_id, branch="other")
-        request.cls.third_commit_hash = api.create_commit(
-            repo_id=repo_id,
-            operations=[
-                CommitOperationAdd(path_in_repo="dummy_file_2.txt", path_or_fileobj=b"v4"),
-            ],
-            commit_message="Add file to other branch",
-            revision="other",
-        ).oid
+            # Third commit on `other`
+            api.create_branch(repo_id=repo_id, branch="other")
+            request.cls.third_commit_hash = api.create_commit(
+                repo_id=repo_id,
+                operations=[
+                    CommitOperationAdd(path_in_repo="dummy_file_2.txt", path_or_fileobj=b"v4"),
+                ],
+                commit_message="Add file to other branch",
+                revision="other",
+            ).oid
 
-        yield
-        api.delete_repo(repo_id=repo_id)
+            yield
+        finally:
+            api.delete_repo(repo_id=repo_id, missing_ok=True)
 
     def test_download_model(self):
         # Test `main` branch
@@ -364,26 +366,31 @@ def test_revision_str():
 
 
 def test_revision_str_is_picklable():
-    revision = ResolvedRevision(resolved=COMMIT_HASH, initial="refs/pr/4")
+    revision = ResolvedRevision(resolved=COMMIT_HASH, initial="refs/pr/4", repo_id="user/repo", repo_type="dataset")
 
     for restored in (pickle.loads(pickle.dumps(revision)), copy.deepcopy(revision)):
         assert restored == "refs/pr/4"
         assert restored.initial == "refs/pr/4"
         assert restored.resolved == COMMIT_HASH
+        # the repo it was resolved for survives as well, otherwise it would be resolved again for that same repo
+        assert restored._repo_id == "user/repo"
+        assert restored._repo_type == "dataset"
 
 
 class TestResolveRevision:
     @pytest.fixture(scope="class", autouse=True)
     def _shared_repo(self, request, api: HfApi):
         repo_id = api.create_repo(repo_name("resolve-revision")).repo_id
-        request.cls.repo_id = repo_id
-        request.cls.commit_hash = api.create_commit(
-            repo_id=repo_id,
-            operations=[CommitOperationAdd(path_in_repo="dummy_file.txt", path_or_fileobj=b"v1")],
-            commit_message="Add file to main branch",
-        ).oid
-        yield
-        api.delete_repo(repo_id=repo_id)
+        try:
+            request.cls.repo_id = repo_id
+            request.cls.commit_hash = api.create_commit(
+                repo_id=repo_id,
+                operations=[CommitOperationAdd(path_in_repo="dummy_file.txt", path_or_fileobj=b"v1")],
+                commit_message="Add file to main branch",
+            ).oid
+            yield
+        finally:
+            api.delete_repo(repo_id=repo_id, missing_ok=True)
 
     def test_resolve_revision(self, api: HfApi, tmp_path: Path):
         revision = api.resolve_revision(self.repo_id, cache_dir=tmp_path)
@@ -399,6 +406,29 @@ class TestResolveRevision:
         # Already resolved => returned as is (no network call)
         with offline():
             assert api.resolve_revision(self.repo_id, revision=revision, cache_dir=tmp_path) is revision
+
+    def test_resolve_revision_for_another_repo(self, api: HfApi, repo_factory, tmp_path: Path):
+        """A revision resolved for one repo tells nothing about another one => it must be resolved again."""
+        revision = api.resolve_revision(self.repo_id, cache_dir=tmp_path)
+        other_repo_id = repo_factory().repo_id
+        other_commit_hash = api.create_commit(
+            repo_id=other_repo_id,
+            operations=[CommitOperationAdd(path_in_repo="dummy_file.txt", path_or_fileobj=b"v1")],
+            commit_message="Add file to main branch",
+        ).oid
+
+        other_revision = api.resolve_revision(other_repo_id, revision=revision, cache_dir=tmp_path)
+        assert other_revision == "main"
+        assert other_revision.resolved == other_commit_hash
+
+        # Another repo type is another repo as well
+        with pytest.raises(RepositoryNotFoundError):
+            api.resolve_revision(self.repo_id, repo_type="dataset", revision=revision, cache_dir=tmp_path)
+
+        # Built by hand, without a repo => trusted for any repo
+        by_hand = ResolvedRevision(resolved=self.commit_hash)
+        with offline():
+            assert api.resolve_revision(other_repo_id, revision=by_hand, cache_dir=tmp_path) is by_hand
 
     def test_resolve_revision_not_cached(self, api: HfApi, tmp_path: Path):
         with offline():

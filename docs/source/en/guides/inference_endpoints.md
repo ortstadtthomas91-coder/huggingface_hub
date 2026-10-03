@@ -7,9 +7,29 @@ This guide assumes `huggingface_hub` is correctly installed and that your machin
 
 
 > [!TIP]
-> **New:** it is now possible to deploy an Inference Endpoint from the [HF model catalog](https://endpoints.huggingface.co/catalog) with a simple API call. The catalog is a carefully curated list of models that can be deployed with optimized settings. You don't need to configure anything, we take all the heavy stuff on us! All models and settings are guaranteed to have been tested to provide best cost/performance balance.  [`create_inference_endpoint_from_catalog`] works the same as [`create_inference_endpoint`], with much less parameters to pass. You can optionally specify an `accelerator` (`"cpu"`, `"gpu"`, or `"neuron"`) to override the default hardware selection. You can use [`list_inference_catalog`] to programmatically retrieve the catalog.
+> **New:** it is now possible to deploy an Inference Endpoint from the [HF model catalog](https://endpoints.huggingface.co/catalog) with a simple API call. The catalog is a carefully curated list of models that can be deployed with optimized settings. You don't need to configure anything, we take all the heavy stuff on us! All models and settings are guaranteed to have been tested to provide best cost/performance balance.  [`create_inference_endpoint_from_catalog`] works the same as [`create_inference_endpoint`], with much less parameters to pass. You can use [`list_inference_catalog`] to programmatically retrieve the catalog.
 >
 > Note that this is still an experimental feature. Let us know what you think if you use it!
+
+Each catalog model is deployed through a *recipe*: a hardware and engine combination that has been tested for it. [`list_inference_catalog`] returns the models with their recipes, and takes server-side filters (`accelerator`, `engine`, `license`, `task`, `search`, `limit`):
+
+```py
+>>> from huggingface_hub import list_inference_catalog
+>>> catalog = list_inference_catalog(task="text-generation", accelerator="neuron")
+>>> catalog[0]
+InferenceCatalogModel(repo_id='meta-llama/Llama-3.1-8B-Instruct', name='Llama-3.1-8B-Instruct', ...)
+>>> catalog[0].recipes
+[InferenceCatalogRecipe(id='sizzling-biryani-g4xsi1ac', accelerator='gpu', engine='vllm', gguf_file=None, revision=None),
+ InferenceCatalogRecipe(id='artisanal-quinoa-yz9ynamx', accelerator='neuron', engine='vllmNeuron', gguf_file=None, revision=None)]
+```
+
+Pass a `repo_id` to [`create_inference_endpoint_from_catalog`] to deploy a model's default recipe, optionally narrowed down with `accelerator` (`"cpu"`, `"gpu"` or `"neuron"`) and `gguf_file`, or pass a `recipe_id` to deploy an exact recipe:
+
+```py
+>>> from huggingface_hub import create_inference_endpoint_from_catalog
+>>> endpoint = create_inference_endpoint_from_catalog(repo_id="openai/gpt-oss-120b")
+>>> endpoint = create_inference_endpoint_from_catalog(recipe_id="artisanal-quinoa-yz9ynamx")
+```
 
 
 ## Find hardware to deploy on
@@ -70,6 +90,9 @@ hf endpoints catalog deploy --repo openai/gpt-oss-120b
 
 # Deploy from the catalog with a specific accelerator
 hf endpoints catalog deploy --repo openai/gpt-oss-120b --accelerator gpu
+
+# Deploy an exact catalog recipe, as listed by 'hf endpoints catalog ls'
+hf endpoints catalog deploy --recipe artisanal-quinoa-yz9ynamx
 ```
 
 
@@ -126,6 +149,24 @@ By default the Inference Endpoint is built from a docker image provided by Huggi
 ```
 
 The value to pass as `custom_image` is a dictionary containing a url to the docker container and configuration to run it. For more details about it, checkout the [Swagger documentation](https://api.endpoints.huggingface.cloud/#/v2%3A%3Aendpoint/create_endpoint).
+
+For an image hosted in a private container registry, pass `container_registry_username` and, when required by the registry, `container_registry_password`. The credentials are only supported for a plain custom container:
+
+```python
+>>> endpoint = create_inference_endpoint(
+...     # Other endpoint and hardware arguments omitted for brevity.
+...     custom_image={"url": "private.registry.example/my-image:latest", "port": 8080},
+...     container_registry_username="user",
+...     container_registry_password="password",
+... )
+```
+
+The equivalent CLI options are `--container-registry-username` and `--container-registry-password`:
+
+```bash
+hf endpoints deploy my-endpoint ... --custom-image private.registry.example/my-image:latest \
+  --container-registry-username user --container-registry-password password
+```
 
 `custom_image` also accepts the engine-specific container types supported by the API, by keying the dictionary with the engine name (`vLLM`, `vLLMNeuron`, `sGLang`, `tgi`, `tgiNeuron`, `tei`, `llamacpp`, `hfServe`, ...) instead of leaving it flat. Each engine takes the usual container fields (`url`, `port`, `healthRoute`) plus its own tuning options. Any dict without a top-level `url` is forwarded to the API untouched, so engines added to the API later work without upgrading `huggingface_hub`:
 

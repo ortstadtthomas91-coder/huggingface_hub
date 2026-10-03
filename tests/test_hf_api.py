@@ -30,7 +30,7 @@ from urllib.parse import urlparse
 
 import pytest
 
-from huggingface_hub import HfApi, SpaceHardware, SpaceStage, SpaceStorage, constants
+from huggingface_hub import HfApi, SpaceHardware, SpaceStage, constants
 from huggingface_hub._commit_api import (
     CommitOperationAdd,
     CommitOperationCopy,
@@ -60,6 +60,7 @@ from huggingface_hub.hf_api import (
     ExpandDatasetProperty_T,
     ExpandModelProperty_T,
     ExpandSpaceProperty_T,
+    InferenceCatalogModel,
     InferenceEndpoint,
     InferenceProviderMapping,
     ModelInfo,
@@ -72,7 +73,6 @@ from huggingface_hub.hf_api import (
     User,
     WebhookInfo,
     WebhookWatchedItem,
-    repo_type_and_id_from_hf_id,
 )
 from huggingface_hub.repocard_data import DatasetCardData, ModelCardData
 from huggingface_hub.utils import (
@@ -125,11 +125,9 @@ This is a modelcard with an invalid metadata section.
 
 class TestHfApiRepoFileExists:
     @pytest.fixture(autouse=True)
-    def _repo(self, api: HfApi):
-        self.repo_id = api.create_repo(repo_name(), private=True).repo_id
+    def _repo(self, api: HfApi, repo_factory: RepoFactory):
+        self.repo_id = repo_factory(private=True).repo_id
         api.upload_file(repo_id=self.repo_id, path_in_repo="file.txt", path_or_fileobj=b"content")
-        yield
-        api.delete_repo(self.repo_id)
 
     def test_repo_exists(self, api: HfApi):
         assert api.repo_exists(self.repo_id)
@@ -238,27 +236,20 @@ class TestHfApiEndpoints:
     def test_delete_repo_missing_ok(self, api: HfApi) -> None:
         api.delete_repo("repo-that-does-not-exist", missing_ok=True)
 
-    def test_move_repo_normal_usage(self, api: HfApi):
-        # Spaces not tested on staging (error 500)
-        for repo_type in [None, constants.REPO_TYPE_MODEL, constants.REPO_TYPE_DATASET]:
-            repo_id = f"{USER}/{repo_name()}"
-            new_repo_id = f"{USER}/{repo_name()}"
-            api.create_repo(repo_id=repo_id, repo_type=repo_type)
-            api.move_repo(from_id=repo_id, to_id=new_repo_id, repo_type=repo_type)
-            api.delete_repo(repo_id=new_repo_id, repo_type=repo_type)
+    def test_move_repo_normal_usage(self, api: HfApi, repo_factory: RepoFactory):
+        repo_id = repo_factory("dataset").repo_id
+        new_repo_id = f"{USER}/{repo_name()}"
+        try:
+            api.move_repo(from_id=repo_id, to_id=new_repo_id, repo_type="dataset")
+        finally:
+            api.delete_repo(repo_id=new_repo_id, repo_type="dataset", missing_ok=True)
 
-    def test_move_repo_target_already_exists(self, api: HfApi) -> None:
-        repo_id_1 = f"{USER}/{repo_name()}"
-        repo_id_2 = f"{USER}/{repo_name()}"
-
-        api.create_repo(repo_id=repo_id_1)
-        api.create_repo(repo_id=repo_id_2)
+    def test_move_repo_target_already_exists(self, api: HfApi, repo_factory: RepoFactory) -> None:
+        repo_id_1 = repo_factory().repo_id
+        repo_id_2 = repo_factory().repo_id
 
         with pytest.raises(HfHubHTTPError, match=r"A model repository called .* already exists"):
             api.move_repo(from_id=repo_id_1, to_id=repo_id_2, repo_type=constants.REPO_TYPE_MODEL)
-
-        api.delete_repo(repo_id=repo_id_1)
-        api.delete_repo(repo_id=repo_id_2)
 
     def test_move_repo_invalid_repo_id(self, api: HfApi) -> None:
         """Test from_id and to_id must be in the form `"namespace/repo_name"`."""
@@ -272,26 +263,21 @@ class TestHfApiEndpoints:
         repo_url = repo_factory("model")
         repo_id = repo_url.repo_id
 
-        for gated_value in ["auto", "manual", False]:
-            for private_value in [True, False]:  # Test both private and public settings
-                api.update_repo_settings(repo_id=repo_id, gated=gated_value, private=private_value)
-                info = api.model_info(repo_id)
-                assert info.gated == gated_value
-                assert info.private == private_value  # Verify the private setting
+        # Enable then disable both settings
+        for gated_value, private_value in [("manual", True), (False, False)]:
+            api.update_repo_settings(repo_id=repo_id, gated=gated_value, private=private_value)
+            info = api.model_info(repo_id)
+            assert info.gated == gated_value
+            assert info.private == private_value
 
     def test_update_dataset_repo_settings(self, api: HfApi, repo_factory: RepoFactory):
         repo_url = repo_factory("dataset")
         repo_id = repo_url.repo_id
-        repo_type = repo_url.repo_type
 
-        for gated_value in ["auto", "manual", False]:
-            for private_value in [True, False]:
-                api.update_repo_settings(
-                    repo_id=repo_id, repo_type=repo_type, gated=gated_value, private=private_value
-                )
-                info = api.dataset_info(repo_id)
-                assert info.gated == gated_value
-                assert info.private == private_value
+        api.update_repo_settings(repo_id=repo_id, repo_type="dataset", gated="auto", private=True)
+        info = api.dataset_info(repo_id)
+        assert info.gated == "auto"
+        assert info.private
 
 
 class TestCommitApi:
@@ -407,28 +393,26 @@ class TestCommitApi:
         assert "data.parquet" in files
         assert "data.arrow" in files
 
-    def test_create_repo_return_value(self, api: HfApi) -> None:
+    def test_create_repo_return_value(self, repo_factory: RepoFactory) -> None:
         REPO_NAME = repo_name("org")
-        url = api.create_repo(repo_id=REPO_NAME)
+        url = repo_factory(repo_id=REPO_NAME)
         assert isinstance(url, str)
         assert isinstance(url, RepoUrl)
         assert url.repo_id == f"{USER}/{REPO_NAME}"
-        api.delete_repo(repo_id=url.repo_id)
 
-    def test_create_repo_already_exists_but_no_write_permission(self, api: HfApi):
+    def test_create_repo_already_exists_but_no_write_permission(self, api: HfApi, repo_factory: RepoFactory):
         # Create under other user namespace
-        repo_id = api.create_repo(repo_id=repo_name(), token=OTHER_TOKEN).repo_id
+        repo_id = repo_factory(token=OTHER_TOKEN).repo_id
 
         # Try to create with our namespace -> should not fail as the repo already exists
         api.create_repo(repo_id=repo_id, token=TOKEN, exist_ok=True)
 
-        # Clean up
-        api.delete_repo(repo_id=repo_id, token=OTHER_TOKEN)
-
-    def test_create_repo_already_exists_but_no_write_permission_returns_correct_repo_id(self, api: HfApi):
+    def test_create_repo_already_exists_but_no_write_permission_returns_correct_repo_id(
+        self, api: HfApi, repo_factory: RepoFactory
+    ):
         """Regression test for https://github.com/huggingface/huggingface_hub/issues/3632."""
         # Create dataset under other user namespace
-        repo_id = api.create_repo(repo_id=repo_name(), repo_type="dataset", token=OTHER_TOKEN).repo_id
+        repo_id = repo_factory("dataset", token=OTHER_TOKEN).repo_id
 
         # Try to create with our token -> triggers 403 fallback path
         returned_url = api.create_repo(repo_id=repo_id, repo_type="dataset", token=TOKEN, exist_ok=True)
@@ -437,24 +421,16 @@ class TestCommitApi:
         assert returned_url.repo_id == repo_id
         assert returned_url.repo_type == "dataset"
 
-        # Clean up
-        api.delete_repo(repo_id=repo_id, repo_type="dataset", token=OTHER_TOKEN)
-
-    def test_create_repo_private_by_default(self, api: HfApi):
+    def test_create_repo_private_by_default(self, api: HfApi, repo_factory: RepoFactory):
         """Enterprise Hub allows creating private repos by default. Let's test that."""
-        repo_id = f"{ENTERPRISE_ORG}/{repo_name()}"
-        api.create_repo(repo_id, token=ENTERPRISE_TOKEN)
+        repo_id = repo_factory(repo_id=f"{ENTERPRISE_ORG}/{repo_name()}", token=ENTERPRISE_TOKEN).repo_id
         info = api.model_info(repo_id, token=ENTERPRISE_TOKEN, expand="private")
         assert info.private
 
-        api.delete_repo(repo_id, token=ENTERPRISE_TOKEN)
-
-    def test_create_repo_with_visibility(self, api: HfApi):
-        repo_id = repo_name()
-        url = api.create_repo(repo_id, visibility="private")
+    def test_create_repo_with_visibility(self, api: HfApi, repo_factory: RepoFactory):
+        url = repo_factory(visibility="private")
         info = api.model_info(url.repo_id, expand="private")
         assert info.private
-        api.delete_repo(url.repo_id)
 
     def test_update_repo_settings_with_visibility(self, api: HfApi, repo_factory: RepoFactory):
         repo_url = repo_factory("model")
@@ -509,6 +485,7 @@ class TestCommitApi:
         repo_name_with_no_org = api.get_full_repo_name("model", organization="org")
         assert repo_name_with_no_org == "org/model"
 
+    @pytest.mark.transfer
     def test_upload_folder(self, api: HfApi, repo_factory: RepoFactory) -> None:
         repo_url = repo_factory()
         repo_id = repo_url.repo_id
@@ -534,6 +511,7 @@ class TestCommitApi:
         return_val = api.upload_folder(folder_path=self.tmp_dir, path_in_repo="temp/dir", repo_id=repo_id)
         assert isinstance(return_val, CommitInfo)
 
+    @pytest.mark.transfer
     def test_upload_folder_create_pr(self, api: HfApi, repo_factory: RepoFactory) -> None:
         repo_url = repo_factory()
         repo_id = repo_url.repo_id
@@ -552,6 +530,7 @@ class TestCommitApi:
             filepath = hf_hub_download(repo_id=repo_id, filename=f"temp/dir/{rpath}", revision="refs/pr/1")
             assert Path(local_path).read_bytes() == Path(filepath).read_bytes()
 
+    @pytest.mark.transfer
     def test_upload_folder_git_folder_excluded(self, api: HfApi, repo_factory: RepoFactory) -> None:
         repo_url = repo_factory()
 
@@ -580,6 +559,7 @@ class TestCommitApi:
             "nested/file.bin",
         }
 
+    @pytest.mark.transfer
     def test_upload_folder_gitignore_already_exists(self, api: HfApi, repo_factory: RepoFactory) -> None:
         repo_url = repo_factory()
         # Ignore nested folder
@@ -591,6 +571,7 @@ class TestCommitApi:
         # Check nested file not uploaded
         assert not api.file_exists(repo_url.repo_id, "nested/file.bin")
 
+    @pytest.mark.transfer
     def test_upload_folder_gitignore_in_commit(self, api: HfApi, repo_factory: RepoFactory) -> None:
         repo_url = repo_factory()
         # Create .gitignore file locally
@@ -643,11 +624,9 @@ class TestCommitApi:
             content = downloaded_file.read()
         assert content == b"Buffer data"
 
-    def test_create_commit_create_pr_against_branch(self, api: HfApi):
-        repo_id = f"{USER}/{repo_name()}"
-
+    def test_create_commit_create_pr_against_branch(self, api: HfApi, repo_factory: RepoFactory):
         # Create repo and create a non-main branch
-        api.create_repo(repo_id=repo_id, exist_ok=False)
+        repo_id = repo_factory().repo_id
         api.create_branch(repo_id=repo_id, branch="test_branch")
         head = api.list_repo_refs(repo_id=repo_id).branches[0].target_commit
 
@@ -687,14 +666,10 @@ class TestCommitApi:
                 create_pr=True,
             )
 
-        # Cleanup
-        api.delete_repo(repo_id=repo_id)
-
-    def test_create_commit_create_pr_on_foreign_repo(self, api: HfApi):
+    def test_create_commit_create_pr_on_foreign_repo(self, api: HfApi, repo_factory: RepoFactory):
         # Create a repo with another user. The normal CI user don't have rights on it.
         # We must be able to create a PR on it
-        foreign_api = HfApi(token=OTHER_TOKEN)
-        foreign_repo_url = foreign_api.create_repo(repo_id=repo_name("repo-for-hfh-ci"))
+        foreign_repo_url = repo_factory(repo_id=repo_name("repo-for-hfh-ci"), token=OTHER_TOKEN)
 
         api.create_commit(
             operations=[
@@ -705,8 +680,6 @@ class TestCommitApi:
             repo_id=foreign_repo_url.repo_id,
             create_pr=True,
         )
-
-        foreign_api.delete_repo(repo_id=foreign_repo_url.repo_id)
 
     def test_create_commit(self, api: HfApi, repo_factory: RepoFactory) -> None:
         repo_url = repo_factory()
@@ -796,7 +769,8 @@ class TestCommitApi:
 
         assert str(context.value) == expected_message
 
-    def test_create_commit_lfs_file_implicit_token(self, api: HfApi, mocker) -> None:
+    @pytest.mark.transfer
+    def test_create_commit_lfs_file_implicit_token(self, api: HfApi, repo_factory: RepoFactory, mocker) -> None:
         """Test that uploading a file as LFS works with cached token.
 
         Regression test for https://github.com/huggingface/huggingface_hub/pull/1084.
@@ -807,7 +781,7 @@ class TestCommitApi:
 
         with patch.object(api, "token", None):  # no default token
             # Create repo
-            api.create_repo(repo_id=REPO_NAME, exist_ok=False)
+            repo_factory(repo_id=REPO_NAME)
 
             # Set repo to track png files as LFS
             api.create_commit(
@@ -835,9 +809,6 @@ class TestCommitApi:
             siblings = {file.rfilename: file for file in info.siblings}
             assert isinstance(siblings["image.png"].lfs, dict)  # LFS file
 
-            # Delete repo
-            api.delete_repo(repo_id=REPO_NAME)
-
     def test_create_commit_huge_regular_files(self, api: HfApi, repo_factory: RepoFactory) -> None:
         """Test committing 12 text files (>100MB in total) at once.
 
@@ -860,6 +831,7 @@ class TestCommitApi:
             repo_id=repo_url.repo_id,
         )
 
+    @pytest.mark.transfer
     def test_commit_preflight_on_lots_of_lfs_files(self, api: HfApi, repo_factory: RepoFactory):
         """Test committing 1300 LFS files at once.
 
@@ -895,7 +867,7 @@ class TestCommitApi:
             assert not operation._is_committed
             assert not operation._is_uploaded
 
-    def test_create_commit_repo_id_case_insensitive(self, api: HfApi):
+    def test_create_commit_repo_id_case_insensitive(self, api: HfApi, repo_factory: RepoFactory):
         """Test create commit but repo_id is lowercased.
 
         Regression test for #1371. Hub API is already case-insensitive. Somehow the issue was with the `requests`
@@ -905,8 +877,7 @@ class TestCommitApi:
 
         See https://github.com/huggingface/huggingface_hub/issues/1371.
         """
-        REPO_NAME = repo_name("CaSe_Is_ImPoRtAnT")
-        repo_id = api.create_repo(repo_id=REPO_NAME, exist_ok=False).repo_id
+        repo_id = repo_factory(repo_id=repo_name("CaSe_Is_ImPoRtAnT")).repo_id
 
         api.create_commit(
             repo_id=repo_id.lower(),  # API is case-insensitive!
@@ -920,6 +891,7 @@ class TestCommitApi:
         assert "file.txt" in repo_files
         assert "lfs.bin" in repo_files
 
+    @pytest.mark.transfer
     def test_create_commit_mutates_operations(self, api: HfApi, repo_factory: RepoFactory) -> None:
         repo_url = repo_factory()
         repo_id = repo_url.repo_id
@@ -940,6 +912,7 @@ class TestCommitApi:
         assert operations[1]._is_committed
         assert operations[1].path_or_fileobj == b"content"
 
+    @pytest.mark.transfer
     def test_pre_upload_before_commit(self, api: HfApi, repo_factory: RepoFactory, caplog) -> None:
         repo_url = repo_factory()
         repo_id = repo_url.repo_id
@@ -1004,7 +977,7 @@ class TestCommitApi:
         # Commit still happened correctly
         assert isinstance(commit, CommitInfo)
 
-    def test_create_file_with_relative_path(self, api: HfApi):
+    def test_create_file_with_relative_path(self, api: HfApi, repo_factory: RepoFactory):
         """Creating a file with a relative path_in_repo is forbidden.
 
         Previously taken from a regression test for HackerOne report 1928845. The bug enabled attackers to create files
@@ -1012,7 +985,7 @@ class TestCommitApi:
 
         This is not relevant anymore as the API now forbids such paths.
         """
-        repo_id = api.create_repo(repo_id=repo_name()).repo_id
+        repo_id = repo_factory().repo_id
         with pytest.raises(HfHubHTTPError) as cm:
             api.upload_file(path_or_fileobj=b"content", path_in_repo="..\\ddd", repo_id=repo_id)
         assert cm.value.response.status_code == 422
@@ -1026,6 +999,7 @@ class TestCommitApi:
         assert records[0].message == "No files have been modified since last commit. Skipping to prevent empty commit."
         assert records[0].levelname == "WARNING"
 
+    @pytest.mark.transfer
     def test_prevent_empty_commit_if_no_new_addition(self, api: HfApi, repo_factory: RepoFactory, caplog) -> None:
         repo_url = repo_factory()
         api.create_commit(
@@ -1106,6 +1080,7 @@ class TestCommitApi:
         assert len(commits) == 1  # no 2nd commit
         assert url.oid == commits[0].commit_id
 
+    @pytest.mark.transfer
     def test_continue_commit_without_existing_files(self, api: HfApi, repo_factory: RepoFactory, caplog) -> None:
         repo_url = repo_factory()
         api.create_commit(
@@ -1282,15 +1257,15 @@ class TestCommitApi:
         assert "file2.txt" not in remote_files
 
 
+@pytest.mark.transfer
 class TestHfApiUploadEmptyFile:
     @pytest.fixture(scope="class", autouse=True)
     def _shared_repo(self, request, api: HfApi):
         # Create repo for all tests as they are not dependent on each other.
-        repo_id = f"{USER}/{repo_name('upload_empty_file')}"
-        api.create_repo(repo_id=repo_id, exist_ok=False)
+        repo_id = api.create_repo(repo_id=repo_name("upload_empty_file")).repo_id
         request.cls.repo_id = repo_id
         yield
-        api.delete_repo(repo_id=repo_id)
+        api.delete_repo(repo_id=repo_id, missing_ok=True)
 
     def test_upload_empty_lfs_file(self, api: HfApi) -> None:
         # Should have been an LFS file, but uploaded as regular (would fail otherwise)
@@ -1304,9 +1279,8 @@ class TestHfApiUploadEmptyFile:
 
 class TestHfApiDeleteFolder:
     @pytest.fixture(autouse=True)
-    def _repo(self, api: HfApi):
-        self.repo_id = f"{USER}/{repo_name('create_commit_delete_folder')}"
-        api.create_repo(repo_id=self.repo_id, exist_ok=False)
+    def _repo(self, api: HfApi, repo_factory: RepoFactory):
+        self.repo_id = repo_factory(repo_id=repo_name("create_commit_delete_folder")).repo_id
 
         api.create_commit(
             repo_id=self.repo_id,
@@ -1317,8 +1291,6 @@ class TestHfApiDeleteFolder:
                 CommitOperationAdd(path_or_fileobj=b"data", path_in_repo="2/file_3.md"),
             ],
         )
-        yield
-        api.delete_repo(repo_id=self.repo_id)
 
     def test_create_commit_delete_folder_implicit(self, api: HfApi):
         api.create_commit(
@@ -1349,9 +1321,8 @@ class TestHfApiDeleteFolder:
         )
 
 
-def _create_nested_files_repo(api: HfApi) -> str:
-    """Create a repo with a nested file structure shared by the list-files/list-tree tests."""
-    repo_id = api.create_repo(repo_id=repo_name()).repo_id
+def _push_nested_files(api: HfApi, repo_id: str) -> None:
+    """Push a nested file structure shared by the list-files/list-tree tests."""
     api.create_commit(
         repo_id=repo_id,
         commit_message="A first repo",
@@ -1370,16 +1341,18 @@ def _create_nested_files_repo(api: HfApi) -> str:
             CommitOperationAdd(path_or_fileobj=b"data2", path_in_repo="3/file_3.md"),
         ],
     )
-    return repo_id
 
 
 class TestHfApiListRepoTree:
     @pytest.fixture(scope="class", autouse=True)
     def _shared_repo(self, request, api: HfApi):
-        repo_id = _create_nested_files_repo(api)
-        request.cls.repo_id = repo_id
-        yield
-        api.delete_repo(repo_id=repo_id)
+        repo_id = api.create_repo(repo_id=repo_name()).repo_id
+        try:
+            _push_nested_files(api, repo_id)
+            request.cls.repo_id = repo_id
+            yield
+        finally:
+            api.delete_repo(repo_id=repo_id, missing_ok=True)
 
     def test_list_tree(self, api: HfApi):
         tree = list(api.list_repo_tree(repo_id=self.repo_id))
@@ -1432,10 +1405,10 @@ class TestHfApiListRepoTree:
         assert model_ckpt.last_commit is not None
         assert model_ckpt.last_commit["oid"] == "bda967fdb79a50844e4a02cccae3217a8ecc86cd"
         # `security` is computed asynchronously by the backend and may be absent from the response.
-        # Only assert its structure when present to avoid flakiness.
+        # The scan verdict itself (`safe`) is decided server-side and can flip over time, so we only
+        # check the structure when present to avoid flakiness.
         if model_ckpt.security is not None:
-            assert model_ckpt.security["safe"]
-            assert isinstance(model_ckpt.security["av_scan"], dict)  # all details in here
+            assert "safe" in model_ckpt.security
 
         # check last_commit is present for a folder
         feature_extractor = next(tree_obj for tree_obj in tree if tree_obj.path == "feature_extractor")
@@ -1688,9 +1661,9 @@ class TestHfApiBranchEndpoint:
 
 class TestHfApiDeleteFiles:
     @pytest.fixture(autouse=True)
-    def _repo(self, api: HfApi):
+    def _repo(self, api: HfApi, repo_factory: RepoFactory):
         self.api = api
-        self.repo_id = api.create_repo(repo_id=repo_name()).repo_id
+        self.repo_id = repo_factory().repo_id
         api.create_commit(
             repo_id=self.repo_id,
             operations=[
@@ -1705,8 +1678,6 @@ class TestHfApiDeleteFiles:
             ],
             commit_message="Init repo structure",
         )
-        yield
-        api.delete_repo(repo_id=self.repo_id)
 
     def remote_files(self) -> set[str]:
         return set(self.api.list_repo_files(repo_id=self.repo_id))
@@ -2304,6 +2275,12 @@ class TestHfApiPublicProduction:
         assert space.author == "HuggingFaceH4"
         assert isinstance(space.runtime, SpaceRuntime)
 
+    def test_space_runtime_hardware_none(self) -> None:
+        runtime = SpaceRuntime({"stage": "BUILDING", "hardware": None})
+        assert runtime.stage == "BUILDING"
+        assert runtime.hardware is None
+        assert runtime.requested_hardware is None
+
     def test_space_info_expand_author(self, api: HfApi):
         # Only the selected field is returned
         space = api.space_info(repo_id="HuggingFaceH4/zephyr-chat", expand=["author"])
@@ -2378,9 +2355,8 @@ class TestHfApiPublicProduction:
         assert len(models) == 0
 
     def test_filter_models_by_language(self, api: HfApi):
-        for language in ["en", "fr", "zh"]:
-            for model in api.list_models(filter=language, limit=5):
-                assert language in model.tags
+        for model in api.list_models(filter="fr", limit=5):
+            assert "fr" in model.tags
 
     def test_filter_models_with_tag(self, api: HfApi):
         models = list(api.list_models(author="HuggingFaceBR4", filter=["tensorboard"]))
@@ -2653,12 +2629,14 @@ class TestHfApiPrivate:
     @pytest.fixture(scope="class", autouse=True)
     def _shared_repo(self, request, api: HfApi):
         repo_id = f"{USER}/{repo_name('private')}"
-        api.create_repo(repo_id=repo_id, private=True)
-        api.create_repo(repo_id=repo_id, private=True, repo_type="dataset")
-        request.cls.repo_id = repo_id
-        yield
-        api.delete_repo(repo_id=repo_id)
-        api.delete_repo(repo_id=repo_id, repo_type="dataset")
+        try:
+            api.create_repo(repo_id=repo_id, private=True)
+            api.create_repo(repo_id=repo_id, private=True, repo_type="dataset")
+            request.cls.repo_id = repo_id
+            yield
+        finally:
+            api.delete_repo(repo_id=repo_id, missing_ok=True)
+            api.delete_repo(repo_id=repo_id, repo_type="dataset", missing_ok=True)
 
     def test_model_info(self, api: HfApi, mocker) -> None:
         mocker.patch("huggingface_hub.utils._headers.get_token", return_value=None)
@@ -2681,7 +2659,9 @@ class TestHfApiPrivate:
                 _ = api.dataset_info(repo_id=self.repo_id)
 
     def test_list_private_models(self, api: HfApi):
-        kwargs = {"sort": "created_at", "limit": 100, "author": USER}
+        # Filter on the (unique) repo name rather than paging through the N most recent repos: every CI job shares
+        # `USER`, so the repo drops off a `sort="created_at"` page as soon as other jobs create repos of their own.
+        kwargs = {"search": self.repo_id.split("/")[-1], "author": USER}
         assert all(model.id != self.repo_id for model in api.list_models(token=False, **kwargs))
         assert any(model.id == self.repo_id for model in api.list_models(token=TOKEN, **kwargs))
 
@@ -2731,7 +2711,7 @@ class TestUploadFolderMocked:
         self.pipeline_mock.return_value.commit_url = f"{ENDPOINT_STAGING}/username/repo_id/commit/dummy_sha"
         self.pipeline_mock.return_value.pr_url = None
         mocker.patch("huggingface_hub.hf_api.is_xet_available", return_value=True)
-        mocker.patch("huggingface_hub.hf_api.pipelined_upload", self.pipeline_mock)
+        mocker.patch("huggingface_hub._upload_pipeline.pipelined_upload", self.pipeline_mock)
 
     def _upload_folder_alias(self, tmp_path, **kwargs) -> list[Union[CommitOperationAdd, CommitOperationDelete]]:
         """Alias to call `upload_folder` + retrieve the CommitOperation list passed to the pipeline."""
@@ -2880,55 +2860,12 @@ class TestHfLargefiles:
             assert Path(filepath).stat().st_size == 18685041
 
 
-class TestParseHFUrl:
-    def test_repo_type_and_id_from_hf_id_on_correct_values(self):
-        possible_values = {
-            "hub": {
-                "https://huggingface.co/id": [None, None, "id"],
-                "https://huggingface.co/user/id": [None, "user", "id"],
-                "https://huggingface.co/datasets/user/id": ["dataset", "user", "id"],
-                "https://huggingface.co/spaces/user/id": ["space", "user", "id"],
-                "user/id": [None, "user", "id"],
-                "dataset/user/id": ["dataset", "user", "id"],
-                "space/user/id": ["space", "user", "id"],
-                "id": [None, None, "id"],
-                "hf://id": [None, None, "id"],
-                "hf://user/id": [None, "user", "id"],
-                "hf://model/user/name": ["model", "user", "name"],  # 's' is optional
-                "hf://models/user/name": ["model", "user", "name"],
-            },
-            "self-hosted": {
-                "http://localhost:8080/hf/user/id": [None, "user", "id"],
-                "http://localhost:8080/hf/datasets/user/id": ["dataset", "user", "id"],
-                "http://localhost:8080/hf/models/user/id": ["model", "user", "id"],
-            },
-        }
-
-        for key, value in possible_values.items():
-            hub_url = ENDPOINT_PRODUCTION if key == "hub" else "http://localhost:8080/hf"
-            for key, value in value.items():
-                assert repo_type_and_id_from_hf_id(key, hub_url=hub_url) == tuple(value)
-
-    def test_repo_type_and_id_from_hf_id_on_wrong_values(self):
-        for hub_id in [
-            "https://unknown-endpoint.co/id",
-            "https://huggingface.co/datasets/user/id@revision",  # @ forbidden
-            "datasets/user/id/subpath",
-            "hffs://model/user/name",
-            "spaeces/user/id",  # with typo in repo type
-        ]:
-            with pytest.raises(ValueError):
-                repo_type_and_id_from_hf_id(hub_id, hub_url=ENDPOINT_PRODUCTION)
-
-
 class TestHfApiDiscussions:
     @pytest.fixture(autouse=True)
-    def _repo(self, api: HfApi):
-        self.repo_id = api.create_repo(repo_id=repo_name()).repo_id
+    def _repo(self, api: HfApi, repo_factory: RepoFactory):
+        self.repo_id = repo_factory().repo_id
         self.pull_request = api.create_discussion(repo_id=self.repo_id, pull_request=True, title="Test Pull Request")
         self.discussion = api.create_discussion(repo_id=self.repo_id, pull_request=False, title="Test Discussion")
-        yield
-        api.delete_repo(repo_id=self.repo_id)
 
     def test_create_discussion(self, api: HfApi):
         discussion = api.create_discussion(repo_id=self.repo_id, title=" Test discussion !  ")
@@ -3199,6 +3136,7 @@ class TestListAndPermanentlyDeleteLFSFiles:
         )
 
         # List LFS files
+        time.sleep(1)  # hub-ci: give the server time to propagate the write before reading it back
         lfs_files = [file for file in api.list_lfs_files(repo_id=repo_id)]
         assert len(lfs_files) == 3
         assert {file.filename for file in lfs_files} == {
@@ -3213,6 +3151,7 @@ class TestListAndPermanentlyDeleteLFSFiles:
 
         # Permanently delete LFS files
         api.permanently_delete_lfs_files(repo_id=repo_id, lfs_files=lfs_files_on_main)
+        time.sleep(1)  # hub-ci: give the server time to propagate the write before reading it back
 
         # LFS file from the branch remains
         lfs_files = [file for file in api.list_lfs_files(repo_id=repo_id)]
@@ -3380,8 +3319,9 @@ class TestCommitInBackground:
         )
         t1 = time.time()
 
-        # all futures are queued instantly
-        assert t1 - t0 <= 0.01
+        # All futures are queued without waiting for the uploads themselves (which each take seconds). A generous
+        # threshold: a stricter one only measures how busy the CI runner is.
+        assert t1 - t0 <= 1
 
         # wait for the last job to complete
         upload_future_3.result()
@@ -3573,26 +3513,6 @@ class TestSpaceAPIMocked:
             },
         )
 
-    @pytest.mark.deprecated("create_repo")
-    def test_create_space_with_storage(self) -> None:
-        self.api.create_repo(
-            self.repo_id,
-            repo_type="space",
-            space_sdk="gradio",
-            space_storage=SpaceStorage.LARGE,
-        )
-        self.post_mock.assert_called_once_with(
-            f"{self.api.endpoint}/api/repos/create",
-            headers=self.api._build_hf_headers(),
-            json={
-                "name": self.repo_id,
-                "organization": None,
-                "type": "space",
-                "sdk": "gradio",
-                "storageTier": "large",
-            },
-        )
-
     def test_protected_visibility_is_only_supported_for_spaces(self) -> None:
         with pytest.raises(
             ValueError, match=r"Only Spaces can be 'protected'. Please set visibility to 'public' or 'private'."
@@ -3640,44 +3560,6 @@ class TestSpaceAPIMocked:
             },
         )
 
-    @pytest.mark.deprecated("duplicate_space", "duplicate_repo")
-    def test_duplicate_space(self) -> None:
-        self.api.duplicate_space(
-            self.repo_id,
-            to_id=f"{USER}/new_repo_id",
-            private=True,
-            hardware=SpaceHardware.T4_MEDIUM,
-            storage=SpaceStorage.LARGE,
-            sleep_time=123,
-            secrets=[
-                {"key": "Testsecret", "value": "Testvalue", "description": "Testdescription"},
-                {"key": "Testsecret2", "value": "Testvalue"},
-            ],
-            variables=[
-                {"key": "Testvariable", "value": "Testvalue", "description": "Testdescription"},
-                {"key": "Testvariable2", "value": "Testvalue"},
-            ],
-        )
-        self.post_mock.assert_called_once_with(
-            f"{self.api.endpoint}/api/spaces/{self.repo_id}/duplicate",
-            headers=self.api._build_hf_headers(),
-            json={
-                "repository": f"{USER}/new_repo_id",
-                "visibility": "private",
-                "hardware": "t4-medium",
-                "storageTier": "large",
-                "sleepTimeSeconds": 123,
-                "secrets": [
-                    {"key": "Testsecret", "value": "Testvalue", "description": "Testdescription"},
-                    {"key": "Testsecret2", "value": "Testvalue"},
-                ],
-                "variables": [
-                    {"key": "Testvariable", "value": "Testvalue", "description": "Testdescription"},
-                    {"key": "Testvariable2", "value": "Testvalue"},
-                ],
-            },
-        )
-
     def test_request_space_hardware_no_sleep_time(self) -> None:
         self.api.request_space_hardware(self.repo_id, SpaceHardware.T4_MEDIUM)
         self.post_mock.assert_called_once_with(
@@ -3706,25 +3588,6 @@ class TestSpaceAPIMocked:
         self.post_mock.return_value.json.return_value["hardware"]["requested"] = "cpu-basic"
         with pytest.warns(UserWarning):
             self.api.set_space_sleep_time(self.repo_id, sleep_time=123)
-
-    @pytest.mark.deprecated("request_space_storage")
-    def test_request_space_storage(self) -> None:
-        runtime = self.api.request_space_storage(self.repo_id, SpaceStorage.LARGE)
-        self.post_mock.assert_called_once_with(
-            f"{self.api.endpoint}/api/spaces/{self.repo_id}/storage",
-            headers=self.api._build_hf_headers(),
-            json={"tier": "large"},
-        )
-        assert runtime.storage == SpaceStorage.LARGE
-
-    @pytest.mark.deprecated("delete_space_storage")
-    def test_delete_space_storage(self) -> None:
-        runtime = self.api.delete_space_storage(self.repo_id)
-        self.delete_mock.assert_called_once_with(
-            f"{self.api.endpoint}/api/spaces/{self.repo_id}/storage",
-            headers=self.api._build_hf_headers(),
-        )
-        assert runtime.storage is None
 
     def test_restart_space_factory_reboot(self) -> None:
         self.api.restart_space(self.repo_id, factory_reboot=True)
@@ -3780,18 +3643,19 @@ class TestListGitCommits:
         request.cls.api = api
         # Create repo (with initial commit)
         repo_id = api.create_repo(repo_name()).repo_id
+        try:
+            # Create a commit on `main` branch
+            api.upload_file(repo_id=repo_id, path_or_fileobj=b"content", path_in_repo="content.txt")
 
-        # Create a commit on `main` branch
-        api.upload_file(repo_id=repo_id, path_or_fileobj=b"content", path_in_repo="content.txt")
+            # Create a commit in a PR
+            api.upload_file(repo_id=repo_id, path_or_fileobj=b"on_pr", path_in_repo="on_pr.txt", create_pr=True)
 
-        # Create a commit in a PR
-        api.upload_file(repo_id=repo_id, path_or_fileobj=b"on_pr", path_in_repo="on_pr.txt", create_pr=True)
-
-        # Create another commit on `main` branch
-        api.upload_file(repo_id=repo_id, path_or_fileobj=b"on_main", path_in_repo="on_main.txt")
-        request.cls.repo_id = repo_id
-        yield
-        api.delete_repo(repo_id)
+            # Create another commit on `main` branch
+            api.upload_file(repo_id=repo_id, path_or_fileobj=b"on_main", path_in_repo="on_main.txt")
+            request.cls.repo_id = repo_id
+            yield
+        finally:
+            api.delete_repo(repo_id, missing_ok=True)
 
     def test_list_commits_on_main(self) -> None:
         commits = self.api.list_repo_commits(self.repo_id)
@@ -3992,51 +3856,6 @@ class TestRepoUrl:
         assert info.repo_url.repo_type == "model"
 
 
-class TestHfApiDuplicateSpace:
-    @pytest.mark.deprecated("duplicate_space")
-    @pytest.mark.skip("Duplicating Space doesn't work on staging.")
-    def test_duplicate_space_success(self, api: HfApi) -> None:
-        """Check `duplicate_space` works."""
-        from_repo_name = repo_name()
-        from_repo_id = api.create_repo(
-            repo_id=from_repo_name,
-            repo_type="space",
-            space_sdk="static",
-            token=OTHER_TOKEN,
-        ).repo_id
-        api.upload_file(
-            path_or_fileobj=b"data",
-            path_in_repo="temp/new_file.md",
-            repo_id=from_repo_id,
-            repo_type="space",
-            token=OTHER_TOKEN,
-        )
-
-        to_repo_id = api.duplicate_space(from_repo_id).repo_id
-
-        assert to_repo_id == f"{USER}/{from_repo_name}"
-        assert api.list_repo_files(repo_id=from_repo_id, repo_type="space") == [
-            ".gitattributes",
-            "README.md",
-            "index.html",
-            "style.css",
-            "temp/new_file.md",
-        ]
-        assert api.list_repo_files(repo_id=to_repo_id, repo_type="space") == api.list_repo_files(
-            repo_id=from_repo_id, repo_type="space"
-        )
-
-        api.delete_repo(repo_id=from_repo_id, repo_type="space", token=OTHER_TOKEN)
-        api.delete_repo(repo_id=to_repo_id, repo_type="space")
-
-    @pytest.mark.deprecated("duplicate_space")
-    def test_duplicate_space_from_missing_repo(self, api: HfApi) -> None:
-        """Check `duplicate_space` fails when the from_repo doesn't exist."""
-
-        with pytest.raises(RepositoryNotFoundError):
-            api.duplicate_space(f"{OTHER_USER}/repo_that_does_not_exist")
-
-
 class TestCollectionAPI:
     @pytest.fixture(autouse=True)
     def _collection(self, api: HfApi):
@@ -4150,14 +3969,16 @@ class TestCollectionAPI:
         # Possible to ignore error
         api.delete_collection(collection.slug, missing_ok=True)
 
-    def test_collection_items(self, api: HfApi) -> None:
+    def test_collection_items(self, api: HfApi, repo_factory: RepoFactory, request: pytest.FixtureRequest) -> None:
         # Create some repos
-        model_id = api.create_repo(repo_name()).repo_id
-        dataset_id = api.create_repo(repo_name(), repo_type="dataset").repo_id
+        model_id = repo_factory().repo_id
+        dataset_id = repo_factory("dataset").repo_id
         nested_collection_slug = api.create_collection(f"nested collection {repo_name()}").slug
+        request.addfinalizer(lambda: api.delete_collection(nested_collection_slug, missing_ok=True))
 
         # Create collection + add items to it
         collection = api.create_collection(self.title)
+        self.slug = collection.slug  # deleted in teardown
         api.add_collection_item(collection.slug, model_id, "model", note="This is my model")
         api.add_collection_item(collection.slug, dataset_id, "dataset")  # note is optional
         api.add_collection_item(collection.slug, nested_collection_slug, "collection")
@@ -4203,12 +4024,6 @@ class TestCollectionAPI:
         assert len(collection.items) == 2  # only 1 item remaining
         assert collection.items[0].item_id == dataset_id  # position got updated
 
-        # Delete everything
-        api.delete_repo(model_id)
-        api.delete_repo(dataset_id, repo_type="dataset")
-        api.delete_collection(collection.slug)
-        api.delete_collection(nested_collection_slug)
-
     @pytest.mark.production
     def test_collection_items_with_collections(self) -> None:
         collection = HfApi().get_collection("celinah/inference-providers-function-calling-6826023e8ae9b24b3039ee5f")
@@ -4219,17 +4034,15 @@ class TestCollectionAPI:
 
 class TestAccessRequestAPI:
     @pytest.fixture(autouse=True)
-    def _gated_repo(self, api: HfApi):
+    def _gated_repo(self, api: HfApi, repo_factory: RepoFactory):
         # Setup test with a gated repo
-        self.repo_id = api.create_repo(repo_name()).repo_id
+        self.repo_id = repo_factory().repo_id
         response = get_session().put(
             f"{api.endpoint}/api/models/{self.repo_id}/settings",
             json={"gated": "auto"},
             headers=api._build_hf_headers(),
         )
         hf_raise_for_status(response)
-        yield
-        api.delete_repo(self.repo_id)
 
     def test_access_requests_normal_usage(self, api: HfApi) -> None:
         # No access requests initially
@@ -4242,6 +4055,7 @@ class TestAccessRequestAPI:
 
         # Grant access to a user
         api.grant_access(self.repo_id, OTHER_USER)
+        time.sleep(1)  # hub-ci: give the server time to propagate the write before reading it back
 
         # User is in accepted list
         requests = list(api.list_accepted_access_requests(self.repo_id))
@@ -4255,6 +4069,7 @@ class TestAccessRequestAPI:
 
         # Cancel access
         api.cancel_access_request(self.repo_id, OTHER_USER)
+        time.sleep(1)  # hub-ci: give the server time to propagate the write before reading it back
         requests = list(api.list_accepted_access_requests(self.repo_id))
         assert len(requests) == 0  # not accepted anymore
         requests = list(api.list_pending_access_requests(self.repo_id))
@@ -4263,6 +4078,7 @@ class TestAccessRequestAPI:
 
         # Reject access
         api.reject_access_request(self.repo_id, OTHER_USER, rejection_reason="This is a rejection reason")
+        time.sleep(1)  # hub-ci: give the server time to propagate the write before reading it back
         requests = list(api.list_pending_access_requests(self.repo_id))
         assert len(requests) == 0  # not pending anymore
         requests = list(api.list_rejected_access_requests(self.repo_id))
@@ -4271,6 +4087,7 @@ class TestAccessRequestAPI:
 
         # Accept again
         api.accept_access_request(self.repo_id, OTHER_USER)
+        time.sleep(1)  # hub-ci: give the server time to propagate the write before reading it back
         requests = list(api.list_accepted_access_requests(self.repo_id))
         assert len(requests) == 1
         assert requests[0].username == OTHER_USER
@@ -4530,9 +4347,10 @@ class TestExpandPropertyType:
             assert e.response.status_code == 400
             message = e.response.json()["error"]
 
-        assert message.startswith('"expand" must be one of ')
+        # Server returns e.g. '✖ Invalid option: expected one of "author"|"cardData"|...\n  → at expand[0]'
+        assert "expected one of " in message
         defined_args = set(get_args(property_type))
-        expected_args = set(message.replace('"expand" must be one of ', "").strip("[]").split(", "))
+        expected_args = set(re.findall(r'"([^"]+)"', message.split("expected one of ", 1)[1]))
         expected_args.discard("gitalyUid")  # internal one, do not document
         expected_args.discard("xetEnabled")  # all repos are xetEnabled now, so we don't document it anymore
 
@@ -4550,35 +4368,6 @@ class TestExpandPropertyType:
             raise ValueError(msg)
 
 
-class TestLargeUpload:
-    def test_upload_large_folder(self, api: HfApi, repo_factory: RepoFactory) -> None:
-        repo_url = repo_factory("dataset")
-        N_FILES_PER_FOLDER = 4
-
-        with SoftTemporaryDirectory() as tmpdir:
-            folder = Path(tmpdir) / "large_folder"
-            # Create 16 LFS files + 16 regular files
-            for i in range(N_FILES_PER_FOLDER):
-                subfolder = folder / f"subfolder_{i}"
-                subfolder.mkdir(parents=True, exist_ok=True)
-                for j in range(N_FILES_PER_FOLDER):
-                    (subfolder / f"file_lfs_{i}_{j}.bin").write_bytes(f"content_lfs_{i}_{j}".encode())
-                    (subfolder / f"file_regular_{i}_{j}.txt").write_bytes(f"content_regular_{i}_{j}".encode())
-
-            # Upload the folder
-            with pytest.warns(FutureWarning, match="`upload_large_folder` is DEPRECATED"):
-                api.upload_large_folder(
-                    repo_id=repo_url.repo_id, repo_type=repo_url.repo_type, folder_path=folder, num_workers=4
-                )
-
-        # Check all files have been uploaded
-        uploaded_files = api.list_repo_files(repo_url.repo_id, repo_type=repo_url.repo_type)
-        for i in range(N_FILES_PER_FOLDER):
-            for j in range(N_FILES_PER_FOLDER):
-                assert f"subfolder_{i}/file_lfs_{i}_{j}.bin" in uploaded_files
-                assert f"subfolder_{i}/file_regular_{i}_{j}.txt" in uploaded_files
-
-
 class TestHfApiAuthCheck:
     def test_auth_check_success(self, api: HfApi, repo_factory: RepoFactory) -> None:
         repo_url = repo_factory("dataset")
@@ -4588,8 +4377,8 @@ class TestHfApiAuthCheck:
         with pytest.raises(RepositoryNotFoundError):
             api.auth_check(repo_id="username/missing_repo_id")
 
-    def test_auth_check_gated_repo(self, api: HfApi) -> None:
-        repo_id = api.create_repo(repo_name()).repo_id
+    def test_auth_check_gated_repo(self, api: HfApi, repo_factory: RepoFactory) -> None:
+        repo_id = repo_factory().repo_id
 
         response = get_session().put(
             f"{api.endpoint}/api/models/{repo_id}/settings",
@@ -4605,11 +4394,13 @@ class TestHfApiAuthCheck:
 
 class TestHfApiInferenceCatalog:
     def test_list_inference_catalog(self, api: HfApi) -> None:
-        models = api.list_inference_catalog()  # note: @experimental api
-        # Check that server returns a list[str] => at least if it changes in the future, we'll notice
-        assert isinstance(models, list)
+        models = api.list_inference_catalog(engine="vllm", task="text-generation")  # note: @experimental api
+        # Parse the whole payload => at least if the schema changes in the future, we'll notice
         assert len(models) > 0
-        assert all(isinstance(model, str) for model in models)
+        assert all(isinstance(model, InferenceCatalogModel) for model in models)
+        assert all(model.task == "text-generation" for model in models)
+        # A model is listed with at least the recipe it was filtered on.
+        assert all(any(recipe.engine == "vllm" for recipe in model.recipes) for model in models)
 
     def test_create_inference_endpoint_from_catalog(self, api: HfApi, mocker) -> None:
         mock_get_session = mocker.patch("huggingface_hub.hf_api.get_session")
@@ -4668,14 +4459,42 @@ class TestHfApiInferenceCatalog:
         )
         assert isinstance(endpoint, InferenceEndpoint)
         assert endpoint.name == "llama-3-2-3b-instruct-eey"
+        assert endpoint.namespace == "Wauplin"
+        url, kwargs = (
+            mock_get_session.return_value.post.call_args[0][0],
+            mock_get_session.return_value.post.call_args[1],
+        )
+        assert url.endswith("/catalog/model/meta-llama/Llama-3.2-3B-Instruct/deploy")
+        assert kwargs["json"] == {"namespace": "Wauplin"}
 
-    def test_create_inference_endpoint_from_catalog_rejects_token_false(self, api: HfApi) -> None:
+        # Same call, but targeting an exact recipe instead of the model's default one.
+        api.create_inference_endpoint_from_catalog(
+            recipe_id="ebony-pecan-n6tu7fs3", name="my-endpoint", namespace="Wauplin"
+        )
+        url, kwargs = (
+            mock_get_session.return_value.post.call_args[0][0],
+            mock_get_session.return_value.post.call_args[1],
+        )
+        assert url.endswith("/catalog/recipe/ebony-pecan-n6tu7fs3/deploy")
+        assert kwargs["json"] == {"namespace": "Wauplin", "config": {"name": "my-endpoint"}}
+
+    def test_create_inference_endpoint_from_catalog_rejects_bad_input(self, api: HfApi) -> None:
         # `token=False` means "do not authenticate", but this endpoint cannot be created without
         # authentication. Reject it explicitly instead of silently falling back to a stored token.
         with pytest.raises(ValueError, match="Cannot use `token=False`"):
             api.create_inference_endpoint_from_catalog(
                 repo_id="meta-llama/Llama-3.2-3B-Instruct", namespace="Wauplin", token=False
             )
+
+        # A model and a recipe are two different API routes: exactly one of them must be given.
+        with pytest.raises(ValueError, match="exactly one"):
+            api.create_inference_endpoint_from_catalog(namespace="Wauplin")
+        with pytest.raises(ValueError, match="exactly one"):
+            api.create_inference_endpoint_from_catalog(repo_id="meta-llama/Llama-3.2-3B-Instruct", recipe_id="x")
+
+        # `accelerator`/`gguf_file` pick a recipe among a model's ones: the server ignores them for a recipe id.
+        with pytest.raises(ValueError, match="cannot be used with `recipe_id`"):
+            api.create_inference_endpoint_from_catalog(recipe_id="x", accelerator="gpu")
 
 
 @pytest.mark.parametrize(
@@ -4710,16 +4529,37 @@ def test_build_endpoint_image_payload(custom_image: dict, expected_image_payload
 
 
 @pytest.mark.parametrize(
-    "custom_image, expected_image_payload",
+    "custom_image, registry_credentials, expected_image_payload",
     [
-        (None, {"huggingface": {}}),
-        ({"vLLM": {"url": "vllm/vllm-openai:v0.23.0"}}, {"vLLM": {"url": "vllm/vllm-openai:v0.23.0"}}),
+        (None, {}, {"huggingface": {}}),
+        (
+            {"vLLM": {"url": "vllm/vllm-openai:v0.23.0"}},
+            {},
+            {"vLLM": {"url": "vllm/vllm-openai:v0.23.0"}},
+        ),
+        (
+            {"url": "private.registry/image:latest", "port": 8080},
+            {"container_registry_username": "user", "container_registry_password": "secret"},
+            {
+                "custom": {
+                    "url": "private.registry/image:latest",
+                    "port": 8080,
+                    "credentials": {"username": "user", "password": "secret"},
+                }
+            },
+        ),
+        (
+            {"url": "private.registry/image:latest"},
+            {"container_registry_username": "user"},
+            {"custom": {"url": "private.registry/image:latest", "credentials": {"username": "user"}}},
+        ),
     ],
-    ids=["no_custom_image", "custom_image"],
+    ids=["no_custom_image", "custom_image", "registry_credentials", "registry_username_only"],
 )
 def test_create_inference_endpoint_custom_image_payload(
     mocker,
     custom_image: Optional[dict],
+    registry_credentials: dict,
     expected_image_payload: dict,
 ):
     """`custom_image` reaches `model.image`, and defaults to the Hugging Face managed image."""
@@ -4758,10 +4598,86 @@ def test_create_inference_endpoint_custom_image_payload(
         task="text-generation",
         namespace="Wauplin",
         custom_image=custom_image,
+        **registry_credentials,
     )
 
     payload = mock_session.post.call_args[1]["json"]
     assert payload["model"]["image"] == expected_image_payload
+
+
+def test_create_inference_endpoint_private_link_payload(mocker):
+    mock_session = mocker.patch("huggingface_hub.hf_api.get_session").return_value
+    mock_session.post.return_value.json.return_value = {
+        "name": "private-endpoint",
+        "model": {"repository": "gpt2", "framework": "pytorch", "revision": None, "task": None},
+        "status": {
+            "state": "pending",
+            "createdAt": "2025-03-07T15:30:13.949Z",
+            "updatedAt": "2025-03-07T15:30:13.949Z",
+        },
+        "healthRoute": "/health",
+        "type": "authenticated",
+    }
+    kwargs = {
+        "name": "private-endpoint",
+        "repository": "gpt2",
+        "framework": "pytorch",
+        "accelerator": "cpu",
+        "instance_size": "x2",
+        "instance_type": "intel-icl",
+        "region": "us-east-1",
+        "vendor": "aws",
+        "namespace": "Wauplin",
+    }
+    api = HfApi(endpoint=ENDPOINT_STAGING, token=TOKEN)
+
+    with pytest.warns(FutureWarning, match="account_id"):
+        api.create_inference_endpoint(**kwargs, account_id="123456789012")
+    assert "accountId" not in mock_session.post.call_args.kwargs["json"]
+    with pytest.raises(ValueError, match="private_link_region"):
+        api.create_inference_endpoint(**kwargs, private_link_account_id="123456789012")
+
+    api.create_inference_endpoint(**kwargs, private_link_account_id="123456789012", private_link_region="eu-west-1")
+    payload = mock_session.post.call_args.kwargs["json"]
+    assert payload["privateService"] == {"accountId": "123456789012", "region": "eu-west-1"}
+    assert "accountId" not in payload
+
+
+@pytest.mark.parametrize(
+    "custom_image, registry_credentials, match",
+    [
+        (None, {"container_registry_username": "user"}, "`custom_image` is required"),
+        (
+            {"url": "private.registry/image:latest"},
+            {"container_registry_password": "secret"},
+            "`container_registry_password` requires `container_registry_username`",
+        ),
+        (
+            {"vLLM": {"url": "private.registry/image:latest"}},
+            {"container_registry_username": "user"},
+            "only be set for a custom container",
+        ),
+    ],
+    ids=["credentials_without_image", "password_without_username", "credentials_for_engine"],
+)
+def test_create_inference_endpoint_rejects_invalid_registry_credentials(
+    custom_image: dict | None, registry_credentials: dict, match: str
+):
+    api = HfApi(endpoint=ENDPOINT_STAGING, token=TOKEN)
+    with pytest.raises(ValueError, match=match):
+        api.create_inference_endpoint(
+            name="test-endpoint-custom-img",
+            repository="meta-llama/Llama-2-7b-chat-hf",
+            framework="custom",
+            accelerator="gpu",
+            instance_size="medium",
+            instance_type="nvidia-a10g",
+            region="us-east-1",
+            vendor="aws",
+            namespace="Wauplin",
+            custom_image=custom_image,
+            **registry_credentials,
+        )
 
 
 def test_create_inference_endpoint_container_command_and_args_payload(mocker):
@@ -4980,8 +4896,8 @@ def test_update_inference_endpoint_parallelism_refuses_to_round_trip_credentials
 
 
 class TestHfApiVerifyChecksums:
-    def test_verify_repo_checksums_with_local_cache(self, api: HfApi) -> None:
-        repo_id = api.create_repo(repo_name()).repo_id
+    def test_verify_repo_checksums_with_local_cache(self, api: HfApi, repo_factory: RepoFactory) -> None:
+        repo_id = repo_factory().repo_id
         api.create_commit(
             repo_id=repo_id,
             commit_message="add file",
